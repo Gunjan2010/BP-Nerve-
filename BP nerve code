@@ -1,0 +1,532 @@
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import cv2
+import pickle
+from tqdm import tqdm
+from glob import glob
+
+import tensorflow as tf
+from tensorflow.keras import backend as K
+from tensorflow.keras.models import Model, load_model
+from tensorflow.keras import Input
+from tensorflow.keras.layers import (
+    Activation, BatchNormalization, Dropout, Conv2D, Conv2DTranspose,
+    MaxPooling2D, GlobalAveragePooling2D, Reshape, Add, Multiply,
+    concatenate,
+)
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from tensorflow.keras.applications.vgg16 import VGG16
+from sklearn.model_selection import GroupKFold
+from sklearn import metrics
+
+
+DATA_ROOT = "/kaggle/input/ultrasound-nerve-segmentation"
+TRAIN_DIR = os.path.join(DATA_ROOT, "train") + "/"
+TEST_DIR = os.path.join(DATA_ROOT, "test") + "/"
+path = TRAIN_DIR  
+height = 128
+width = 128
+
+
+# ---------------------------------------------------------------------------
+def plot_dataset_distribution(train_dir, test_dir):
+    train_count = len([f for f in os.listdir(train_dir)]) if os.path.isdir(train_dir) else 0
+    test_count = len([f for f in os.listdir(test_dir)]) if os.path.isdir(test_dir) else 0
+
+    fig, ax = plt.subplots(figsize=(5, 5))
+    bars = ax.bar(["Train", "Test"], [train_count, test_count], color=["#2980b9", "#e67e22"])
+    for bar in bars:
+        h = bar.get_height()
+        ax.annotate(f"{h}", xy=(bar.get_x() + bar.get_width() / 2, h),
+                    xytext=(0, 3), textcoords="offset points", ha="center")
+    ax.set_ylabel("Number of Files")
+    ax.set_title("Figure 2: Set Wise Image Distribution")
+    plt.tight_layout()
+    plt.savefig("figure_2_set_wise_distribution.png", dpi=150, bbox_inches="tight")
+    plt.show()
+    return train_count, test_count
+
+
+plot_dataset_distribution(TRAIN_DIR, TEST_DIR)
+EPOCHS = 50
+BATCH_SIZE = 64
+LEARNING_RATE = 0.0001
+N_FOLDS = 5
+DICE_SMOOTH = 100.0  
+
+
+# ---------------------------------------------------------------------------
+# 1. Metrics / loss
+# ---------------------------------------------------------------------------
+def dice_coef(y_true, y_pred, smooth=DICE_SMOOTH):
+    y_true_f = K.flatten(y_true)
+    y_pred_f = K.flatten(y_pred)
+    intersection = K.sum(y_true_f * y_pred_f)
+    return (2. * intersection + smooth) / (K.sum(y_true_f) + K.sum(y_pred_f) + smooth)
+
+
+def iou(y_true, y_pred, smooth=DICE_SMOOTH):
+    y_true_f = K.flatten(y_true)
+    y_pred_f = K.flatten(y_pred)
+    intersection = K.sum(y_true_f * y_pred_f) + smooth
+    union = K.sum(y_true_f + y_pred_f - y_true_f * y_pred_f) + smooth
+    return intersection / union
+
+
+def dice_coef_loss(y_true, y_pred):
+    return -dice_coef(y_true, y_pred)
+
+
+def sensitivity(y_true, y_pred):
+    
+    s = K.sum(y_true, axis=(1, 2, 3))
+    y_true_c = s / (s + K.epsilon())
+    s_ = K.sum(y_pred, axis=(1, 2, 3))
+    y_pred_c = s_ / (s_ + K.epsilon())
+    true_positives = K.sum(K.round(K.clip(y_true_c * y_pred_c, 0, 1)))
+    possible_positives = K.sum(K.round(K.clip(y_true_c, 0, 1)))
+    return true_positives / (possible_positives + K.epsilon())
+
+
+def specificity(y_true, y_pred):
+    
+    s = K.sum(y_true, axis=(1, 2, 3))
+    y_true_c = s / (s + K.epsilon())
+    s_ = K.sum(y_pred, axis=(1, 2, 3))
+    y_pred_c = s_ / (s_ + K.epsilon())
+    true_negatives = K.sum(K.round(K.clip((1 - y_true_c) * (1 - y_pred_c), 0, 1)))
+    possible_negatives = K.sum(K.round(K.clip(1 - y_true_c, 0, 1)))
+    return true_negatives / (possible_negatives + K.epsilon())
+
+
+# ---------------------------------------------------------------------------
+# 2. Architecture pieces
+# ---------------------------------------------------------------------------
+class GCAlpha(tf.keras.layers.Layer):
+   
+    def build(self, input_shape):
+        self.alpha = self.add_weight(name="gcb_alpha", shape=(), initializer="zeros", trainable=True)
+
+    def call(self, inputs):
+        return inputs * self.alpha
+
+
+def global_context_block(inputs, name=None):
+    
+    channels = int(inputs.shape[-1])
+    context = GlobalAveragePooling2D()(inputs)                       
+    context = Reshape((1, 1, channels))(context)
+    context = Conv2D(max(channels // 8, 8), (1, 1), activation="relu")(context)
+    context = Conv2D(channels, (1, 1))(context)                      
+    context = GCAlpha()(context)                                     
+    return Add(name=name)([inputs, context])                         
+
+
+def res_block(inputs, filter_size):
+    cb1 = Conv2D(filter_size, (3, 3), padding="same", activation="relu")(inputs)
+    cb2 = Conv2D(filter_size, (1, 1), padding="same", activation="relu")(inputs)
+    return Add()([cb1, cb2])
+
+
+def res_path(inputs, filter_size, path_number):
+    skip_connection = res_block(inputs, filter_size)
+    if path_number == 2:
+        skip_connection = res_block(skip_connection, filter_size)
+    elif path_number == 1:
+        skip_connection = res_block(skip_connection, filter_size)
+        skip_connection = res_block(skip_connection, filter_size)
+    return skip_connection
+
+
+def attention_gate(skip, decoder, inter_channels):
+    
+    theta_x = Conv2D(inter_channels, (1, 1), padding="same")(skip)     # Wx * F_skip
+    phi_g = Conv2D(inter_channels, (1, 1), padding="same")(decoder)    # Wg * F_decoder
+    f = Activation("relu")(Add()([theta_x, phi_g]))
+    psi = Conv2D(1, (1, 1), padding="same", activation="sigmoid")(f)   # A
+    return Multiply()([skip, psi])                                     # F_refined
+
+
+def decoder_block(inputs, res, out_channels, depth):
+    
+    conv_kwargs = dict(activation="relu", padding="same", kernel_initializer="he_normal")
+
+    db = Conv2DTranspose(out_channels, (2, 2), strides=(2, 2), padding="same")(inputs)
+    attended_res = attention_gate(res, db, max(out_channels // 2, 8))
+    db = concatenate([db, attended_res], axis=3)
+    db = Conv2D(out_channels, 3, **conv_kwargs)(db)
+    db = Conv2D(out_channels, 3, **conv_kwargs)(db)
+    if depth > 2:
+        db = Conv2D(out_channels, 3, **conv_kwargs)(db)
+    return db
+
+
+def bottleneck_center_block(inputs, filters=512, dropout_rate=0.3):
+    
+    x = Conv2D(filters, (3, 3), padding="same", dilation_rate=2)(inputs)
+    x = BatchNormalization()(x)
+    x = Activation("relu")(x)
+    x = Conv2D(filters, (3, 3), padding="same")(x)
+    x = BatchNormalization()(x)
+    x = Activation("relu")(x)
+    x = Dropout(dropout_rate)(x)
+    shortcut = Conv2D(filters, (1, 1), padding="same")(inputs)
+    x = Add()([x, shortcut])
+    return Activation("relu")(x)
+
+
+def VGGContextAttResUNet(input_size=(128, 128, 1)):
+  
+    inputs = Input(input_size)
+
+    stem = Conv2D(3, (1, 1), padding="same", name="gray_to_rgb")(inputs)
+
+    encoder = VGG16(include_top=False, weights="imagenet", input_shape=(input_size[0], input_size[1], 3))
+
+    enc1 = encoder.get_layer(name="block1_conv1")(stem)
+    enc1 = encoder.get_layer(name="block1_conv2")(enc1)
+    enc1 = global_context_block(enc1, name="gcb_enc1")
+    p1 = MaxPooling2D(pool_size=(2, 2))(enc1)
+
+    enc2 = encoder.get_layer(name="block2_conv1")(p1)
+    enc2 = encoder.get_layer(name="block2_conv2")(enc2)
+    enc2 = global_context_block(enc2, name="gcb_enc2")
+    p2 = MaxPooling2D(pool_size=(2, 2))(enc2)
+
+    enc3 = encoder.get_layer(name="block3_conv1")(p2)
+    enc3 = encoder.get_layer(name="block3_conv2")(enc3)
+    enc3 = encoder.get_layer(name="block3_conv3")(enc3)
+    enc3 = global_context_block(enc3, name="gcb_enc3")
+    p3 = MaxPooling2D(pool_size=(2, 2))(enc3)
+
+    center = bottleneck_center_block(p3, filters=512)
+    center = global_context_block(center, name="gcb_center")
+
+    res_path3 = res_path(enc3, 128, 3)
+    dec3 = decoder_block(center, res_path3, 256, 3)
+
+    res_path2 = res_path(enc2, 64, 2)
+    dec2 = decoder_block(dec3, res_path2, 128, 2)
+
+    res_path1 = res_path(enc1, 32, 1)
+    dec1 = decoder_block(dec2, res_path1, 64, 1)
+
+    out = Conv2D(1, 1)(dec1)
+    out = Activation("sigmoid", name="seg")(out)
+
+    return Model(inputs=[inputs], outputs=[out])
+
+
+# ---------------------------------------------------------------------------
+# 3. Preprocessing pipeline 
+# ---------------------------------------------------------------------------
+def normalize_image(img):
+   
+    return img / 255.0
+
+
+def binarize_mask(mask, threshold=0.5):
+    
+    mask = mask / 255.0
+    mask[mask > threshold] = 1
+    mask[mask <= threshold] = 0
+    return mask
+
+
+def adjust_data(img, mask):
+    
+    img = normalize_image(img)
+    mask = binarize_mask(mask)
+    return img, mask
+
+
+def train_generator(data_frame, batch_size, train_path, aug_dict,
+                     target_size=(height, width), seed=1):
+    
+   
+    image_datagen = ImageDataGenerator(**aug_dict)
+    mask_datagen = ImageDataGenerator(**aug_dict)
+
+    image_generator = image_datagen.flow_from_dataframe(
+        data_frame, directory=train_path, x_col="filename", class_mode=None,
+        color_mode="grayscale",
+        target_size=target_size,  # STEP 1 -- Resizing of Images
+        batch_size=batch_size, seed=seed)
+
+    mask_generator = mask_datagen.flow_from_dataframe(
+        data_frame, directory=train_path, x_col="mask", class_mode=None,
+        color_mode="grayscale",
+        target_size=target_size,  # STEP 1 -- Resizing of Images
+        batch_size=batch_size, seed=seed)
+
+    gen = zip(image_generator, mask_generator)
+    for img, mask in gen:
+        img, mask = adjust_data(img, mask)  # STEP 3 + STEP 4
+        yield img, mask
+
+
+def get_subject_id(file_path):
+    
+    return os.path.basename(file_path).split("_")[0]
+
+
+# ---------------------------------------------------------------------------
+# 4. STEP 2 -- Data Augmentation + STEP 5 -- Pairing Images
+#    with Masks.
+## ---------------------------------------------------------------------------
+train_mask = glob(path + "*_mask*")
+train_image = [m.replace("_mask", "") for m in train_mask]
+
+pos_mask, pos_img, neg_mask, neg_img = [], [], [], []
+for mask_path, img_path in zip(train_mask, train_image):
+    mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+    (neg_mask if np.sum(mask) == 0 else pos_mask).append(mask_path)
+    (neg_img if np.sum(mask) == 0 else pos_img).append(img_path)
+
+os.makedirs("generated/img", exist_ok=True)
+
+
+def flip_up_down(img):
+    """STEP 2 (offline) -- Data Augmentation: vertical flip."""
+    return cv2.flip(img.copy(), 0)
+
+
+def flip_right_left(img):
+    """STEP 2 (offline) -- Data Augmentation: horizontal flip."""
+    return cv2.flip(img.copy(), 1)
+
+
+gen_img, gen_mask = [], []
+for img_path, mask_path in tqdm(zip(pos_img, pos_mask)):
+    image_name = img_path.split("/")[-1].split(".")[0]
+    uf_img_path = f"generated/img/{image_name}_uf.jpg"
+    uf_mask_path = f"generated/img/{image_name}_uf_mask.jpg"
+    rf_img_path = f"generated/img/{image_name}_rf.jpg"
+    rf_mask_path = f"generated/img/{image_name}_rf_mask.jpg"
+
+    img = cv2.imread(img_path)
+    mask = cv2.imread(mask_path)
+    cv2.imwrite(uf_img_path, flip_up_down(img))
+    cv2.imwrite(uf_mask_path, flip_up_down(mask))
+    cv2.imwrite(rf_img_path, flip_right_left(img))
+    cv2.imwrite(rf_mask_path, flip_right_left(mask))
+
+    gen_img += [uf_img_path, rf_img_path]
+    gen_mask += [uf_mask_path, rf_mask_path]
+
+aug_img = gen_img + train_image
+aug_mask = gen_mask + train_mask
+
+
+def pair_images_with_masks(image_paths, mask_paths, shuffle=True):
+    
+    frame = pd.DataFrame(data={"filename": image_paths, "mask": mask_paths})
+    frame["subject"] = frame["filename"].apply(get_subject_id)
+    if shuffle:
+        frame = frame.sample(frac=1).reset_index(drop=True)
+    return frame
+
+
+df = pair_images_with_masks(aug_img, aug_mask)
+
+n_subjects = df["subject"].nunique()
+print(f"Found {n_subjects} unique subjects across {len(df)} images "
+      f"(manuscript reports 47 subjects).")
+
+
+# ---------------------------------------------------------------------------
+# 5. Subject-wise 5-fold cross-validation 
+# ---------------------------------------------------------------------------
+train_generator_args = dict(rotation_range=0.2, width_shift_range=0.05,
+                             height_shift_range=0.05, shear_range=0.05,
+                             zoom_range=0.05, horizontal_flip=True, fill_mode="nearest")
+
+gkf = GroupKFold(n_splits=N_FOLDS)
+
+histories, losses, accuracies, dicecoefs, ious = [], [], [], [], []
+sensitivities, specificities = [], []
+
+for k, (train_index, test_index) in enumerate(gkf.split(df, groups=df["subject"])):
+    fold_num = k + 1
+    train_data_frame = df.iloc[train_index]
+    test_data_frame = df.iloc[test_index]
+
+    # Sanity check: no subject should appear in both splits.
+    overlap = set(train_data_frame["subject"]) & set(test_data_frame["subject"])
+    assert not overlap, f"Fold {fold_num}: subject leakage detected: {overlap}"
+
+    print(f"\n{'='*30}\nFold {fold_num}/{N_FOLDS} "
+          f"({train_data_frame['subject'].nunique()} train subjects, "
+          f"{test_data_frame['subject'].nunique()} test subjects)\n{'='*30}")
+
+    train_gen = train_generator(train_data_frame, BATCH_SIZE, None, train_generator_args,
+                                 target_size=(height, width))
+    test_gen_eval = train_generator(test_data_frame, BATCH_SIZE, None, dict(),
+                                     target_size=(height, width))
+
+    model = VGGContextAttResUNet(input_size=(height, width, 1))
+    model.compile(optimizer=Adam(learning_rate=LEARNING_RATE, clipnorm=1.0),
+                  loss=dice_coef_loss,
+                  metrics=[iou, dice_coef, sensitivity, specificity, "binary_accuracy"])
+
+    model_checkpoint = ModelCheckpoint(f"{fold_num}_unet_ner_seg.hdf5", verbose=1, save_best_only=True)
+    early_stopping = EarlyStopping(monitor="val_loss", mode="min", patience=10,
+                                    restore_best_weights=True, verbose=1)
+
+    history = model.fit(train_gen,
+                         steps_per_epoch=len(train_data_frame) // BATCH_SIZE,
+                         epochs=EPOCHS,
+                         callbacks=[model_checkpoint, early_stopping],
+                         validation_data=test_gen_eval,
+                         validation_steps=len(test_data_frame) // BATCH_SIZE)
+
+    model = load_model(f"{fold_num}_unet_ner_seg.hdf5",
+                        custom_objects={"dice_coef_loss": dice_coef_loss, "iou": iou,
+                                        "dice_coef": dice_coef, "sensitivity": sensitivity,
+                                        "specificity": specificity, "GCAlpha": GCAlpha})
+
+    test_gen_eval = train_generator(test_data_frame, BATCH_SIZE, None, dict(),
+                                     target_size=(height, width))
+    results = model.evaluate(test_gen_eval, steps=len(test_data_frame) // BATCH_SIZE)
+    results = dict(zip(model.metrics_names, results))
+
+    histories.append(history)
+    losses.append(results["loss"])
+    accuracies.append(results["binary_accuracy"])
+    dicecoefs.append(results["dice_coef"])
+    ious.append(results["iou"])
+    sensitivities.append(results["sensitivity"])
+    specificities.append(results["specificity"])
+
+    print(f"Fold {fold_num} -> Loss: {results['loss']:.4f}, "
+          f"Accuracy: {results['binary_accuracy']:.4f}, IoU: {results['iou']:.4f}, "
+          f"Dice: {results['dice_coef']:.4f}, Sensitivity: {results['sensitivity']:.4f}, "
+          f"Specificity: {results['specificity']:.4f}")
+
+
+# ---------------------------------------------------------------------------
+# 6. Per-fold training curves 
+# ---------------------------------------------------------------------------
+METRIC_ORDER = [
+    ("loss", "Loss"),
+    ("binary_accuracy", "Binary Accuracy"),
+    ("iou", "Jaccard Index (IoU)"),
+    ("dice_coef", "Dice Coefficient"),
+    ("sensitivity", "Sensitivity"),
+    ("specificity", "Specificity"),
+]
+PANEL_LETTERS = "abcdef"
+
+for h, history in enumerate(histories):
+    fig, axs = plt.subplots(1, len(METRIC_ORDER), figsize=(5 * len(METRIC_ORDER), 5))
+    fig.suptitle(f"Figure {7 + h}: Training and Validation Metrics for "
+                 f"Cross-Fold Validation-{h + 1}", fontsize=16)
+
+    for i, (key, label) in enumerate(METRIC_ORDER):
+        training = history.history[key]
+        validation = history.history.get("val_" + key)
+        epochs_range = range(1, len(training) + 1)
+        axs[i].plot(epochs_range, training, "r--", label=f"Training {label}")
+        if validation is not None:
+            axs[i].plot(epochs_range, validation, "b-", label=f"Validation {label}")
+        axs[i].set_xlabel("Epoch")
+        axs[i].set_title(f"({PANEL_LETTERS[i]}) {label}")
+        axs[i].legend()
+
+    plt.tight_layout()
+    plt.savefig(f"figure_{7 + h}_fold_{h + 1}_training_curves.png", dpi=150, bbox_inches="tight")
+    plt.show()
+    with open(f"{h + 1}_ultrasound_trainHistoryDict", "wb") as f:
+        pickle.dump(history.history, f)
+
+
+# ---------------------------------------------------------------------------
+# 7. Five-fold 
+# ---------------------------------------------------------------------------
+fold_labels = [f"Fold-{i + 1}" for i in range(N_FOLDS)]
+results_table = pd.DataFrame({"Parameter": ["Loss", "Accuracy", "Jaccard Index",
+                                             "Dice_Coeff", "Sensitivity", "Specificity"]})
+for i in range(N_FOLDS):
+    results_table[fold_labels[i]] = [losses[i], accuracies[i], ious[i],
+                                      dicecoefs[i], sensitivities[i], specificities[i]]
+results_table["Average"] = results_table[fold_labels].mean(axis=1)
+results_table["Std Dev"] = results_table[fold_labels].std(axis=1)
+
+for col in fold_labels + ["Average", "Std Dev"]:
+    results_table[col] = results_table[col].astype(float).round(3)
+
+print("\n=== Subject-wise Five-Fold Cross-Validation Results (single config) ===")
+print(results_table.to_string(index=False))
+results_table.to_csv("five_fold_results_summary.csv", index=False)
+
+
+fig12_metrics = ["Accuracy", "Sensitivity", "Specificity", "Jaccard Index", "Dice_Coeff"]
+fig12_labels = fold_labels + ["Average"]
+x = np.arange(len(fig12_labels))
+bar_width = 0.15
+
+fig, ax = plt.subplots(figsize=(11, 6))
+for i, metric in enumerate(fig12_metrics):
+    row = results_table.loc[results_table["Parameter"] == metric, fold_labels + ["Average"]].values[0]
+    ax.bar(x + i * bar_width, row, bar_width, label=metric)
+
+ax.set_xticks(x + bar_width * (len(fig12_metrics) - 1) / 2)
+ax.set_xticklabels(fig12_labels)
+ax.set_ylabel("Score")
+ax.set_ylim(0, 1.05)
+ax.set_title("Figure 12: Graphical Analysis of Cross Fold Validation with Average Values")
+ax.legend(loc="lower right", ncol=len(fig12_metrics), fontsize=8)
+plt.tight_layout()
+plt.savefig("figure_12_cross_fold_average_values.png", dpi=150, bbox_inches="tight")
+plt.show()
+
+
+selector = int(np.argmin(np.abs(np.array(ious) - np.mean(ious))))
+selected_fold = selector + 1
+print(f"\nUsing Fold {selected_fold} model for qualitative visualization "
+      f"(IoU closest to the 5-fold mean).")
+
+best_model = load_model(f"{selected_fold}_unet_ner_seg.hdf5",
+                         custom_objects={"dice_coef_loss": dice_coef_loss, "iou": iou,
+                                         "dice_coef": dice_coef, "sensitivity": sensitivity,
+                                         "specificity": specificity, "GCAlpha": GCAlpha})
+
+
+_, selected_test_index = list(gkf.split(df, groups=df["subject"]))[selector]
+viz_test_frame = df.iloc[selected_test_index].reset_index(drop=True)
+
+n_examples = min(6, len(viz_test_frame))
+sample_rows = viz_test_frame.sample(n=n_examples, random_state=0)
+
+fig, axs = plt.subplots(n_examples, 3, figsize=(9, 3 * n_examples))
+if n_examples == 1:
+    axs = axs.reshape(1, 3)
+fig.suptitle("Figure 13: Visualization of Segmentation Results", fontsize=16)
+
+for row_i, (_, row) in enumerate(sample_rows.iterrows()):
+    img_gray = cv2.imread(row["filename"], cv2.IMREAD_GRAYSCALE)
+    img_gray = cv2.resize(img_gray, (width, height))
+    mask_gray = cv2.imread(row["mask"], cv2.IMREAD_GRAYSCALE)
+    mask_gray = cv2.resize(mask_gray, (width, height))
+
+    model_input = normalize_image(img_gray.astype(np.float32))[np.newaxis, :, :, np.newaxis]
+    pred_mask = best_model.predict(model_input, verbose=0)[0, :, :, 0]
+
+    axs[row_i, 0].imshow(img_gray, cmap="gray")
+    axs[row_i, 0].set_title("Original Image")
+    axs[row_i, 1].imshow(mask_gray, cmap="gray")
+    axs[row_i, 1].set_title("Ground-Truth Mask")
+    axs[row_i, 2].imshow(pred_mask > 0.5, cmap="gray")
+    axs[row_i, 2].set_title("Predicted Mask")
+    for c in range(3):
+        axs[row_i, c].axis("off")
+
+plt.tight_layout()
+plt.savefig("figure_13_segmentation_visualization.png", dpi=150, bbox_inches="tight")
+plt.show()
+
+
